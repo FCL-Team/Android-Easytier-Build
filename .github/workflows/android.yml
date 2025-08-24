@@ -1,0 +1,110 @@
+name: Android static lib
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Normalize config
+        run: |
+          sed -i 's/\r$//' BUILD_CONFIG.env
+          grep -vE '^(#|$)' BUILD_CONFIG.env >> "$GITHUB_ENV"
+
+      - name: Prepare scripts
+        run: |
+          sed -i 's/\r$//' scripts/*.sh
+          chmod +x scripts/*.sh
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.RUST_TARGETS }}
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          which protoc && protoc --version
+
+      - name: Fetch EasyTier
+        run: bash ./scripts/fetch_easytier.sh --url "$REPO_URL" ${ET_REF:+--ref "$ET_REF"}
+
+      - name: Build for ${{ matrix.abi }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          PROTOC: /usr/bin/protoc
+          ABIS: ${{ matrix.abi }}
+        run: bash ./scripts/build_android.sh
+
+      - name: Normalize outputs to dist
+        run: |
+          set -e
+          abi='${{ matrix.abi }}'
+          case "$abi" in
+            arm64-v8a)    triple=aarch64-linux-android ;;
+            armeabi-v7a)  triple=armv7-linux-androideabi ;;
+            x86)          triple=i686-linux-android ;;
+            x86_64)       triple=x86_64-linux-android ;;
+            *) echo "Unknown ABI: $abi"; exit 1 ;;
+          esac
+          mkdir -p "dist/$abi"
+          if [ ! -f "dist/$abi/libeasytier_ffi.a" ]; then
+            src=$(find third_party/easytier/target/$triple -type f -name 'libeasytier_ffi.a' | head -n1 || true)
+            if [ -n "$src" ]; then
+              cp "$src" "dist/$abi/libeasytier_ffi.a"
+            else
+              echo "ERROR: libeasytier_ffi.a not found for $abi (triple: $triple)"
+              find third_party/easytier/target/$triple -maxdepth 3 -type f -name 'libeasytier_ffi.*' -print || true
+              exit 1
+            fi
+          fi
+          find dist -maxdepth 2 -type f -print
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.abi }}
+          path: dist/${{ matrix.abi }}/libeasytier_ffi.a
+
+  package:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load config
+        run: |
+          sed -i 's/\r$//' BUILD_CONFIG.env
+          grep -vE '^(#|$)' BUILD_CONFIG.env >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Zip libs
+        run: |
+          set -e
+          mkdir -p artifacts
+          ref="${ET_REF:-unknown}"
+          ndk="${NDK_VERSION:-unknown}"
+          ref_sanitized="${ref//\//-}"
+          zip -r "artifacts/libs-${ref_sanitized}-${ndk}.zip" dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libeasytier_ffi-android-libs
+          path: artifacts/*.zip
